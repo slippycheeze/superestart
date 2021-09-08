@@ -1,71 +1,97 @@
-# -*- coding: utf8 -*-
+# -*- coding: utf-8 -*-
 
 import argparse
 import logging
-import xmlrpclib
+import os
 
 from datetime import datetime
+from functools import partial
 
+import argparse_logging
 from croniter import croniter
-from supervisor.childutils import listener
+from supervisor.childutils import listener, getRPCInterface
 
 
 def cli():
-    """Command line."""
+    """Create ArgumentParser for the CLI."""
     parser = argparse.ArgumentParser(description="superestart")
-    parser.add_argument("--group_name",
-                        type=str,
-                        dest="group_name",
-                        help="group name")
-    parser.add_argument("--program_name",
-                        type=str,
-                        dest="program_name",
-                        help="program name")
-    parser.add_argument("--crontab",
-                        type=str,
-                        dest="cron_str",
-                        required=True,
-                        help="crontab like string")
-    parser.add_argument("--api_endpoint",
-                        type=str,
-                        dest="api_endpoint",
-                        required=True,
-                        help="supervisord api endpoint")
+
+    # what to act on
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--group",
+        type=str,
+        dest="group",
+        help="group name"
+    )
+    target.add_argument(
+        "--program",
+        type=str,
+        dest="program",
+        help="program name"
+    )
+
+    # ...and everything else.
+    parser.add_argument(
+        "--action",
+        type=str,
+        choices=['restart', 'start', 'stop'],
+        default='restart',
+        dest='action',
+        help="the action to take on the program or group"
+    )
+    parser.add_argument(
+        "--crontab",
+        type=str,
+        dest="crontab",
+        required=True,
+        help="crontab like string"
+    )
+
+    # logging customization, thanks!
+    argparse_logging.add_logging_arguments(parser)
     return parser
 
 
 def main():
-    parser = cli()
-    args = parser.parse_args()
+    args = cli().parse_args()
 
-    server = xmlrpclib.Server("http://%s/RPC2" % args.api_endpoint)
-    now = datetime.now()
+    server = getRPCInterface(os.environ)
 
-    time_iter = croniter(args.cron_str, now)
+    time_iter = croniter(args.crontab, datetime.now())
     next_execute_time = time_iter.get_next(datetime)
+    logging.info(f"next execution due at {next_execute_time}")
 
-    if not args.group_name and not args.program_name:
-        raise Exception("group_name or program_name should be set")
-
-    group_name = args.group_name
-    program_name = args.program_name
+    # ugly, but YOLO.  nicer if there were some action handler that
+    # stored both the name *and* the argument that were passed, but so
+    # it goes.
+    if args.group:
+        target = args.group
+        do_stop = partial(server.supervisor.stopProcessGroup, args.group)
+        do_start = partial(server.supervisor.startProcessGroup, args.group)
+    elif args.program:
+        target = args.program
+        do_stop = partial(server.supervisor.stopProcess, args.program)
+        do_start = partial(server.supervisor.startProcess, args.program)
 
     while True:
-        headers, _ = listener.wait()
-        if "TICK" in headers["eventname"]:
-            cur_now = datetime.now()
-            if cur_now >= next_execute_time:
-                if group_name:
-                    server.supervisor.stopProcessGroup(group_name)
-                    server.supervisor.startProcessGroup(group_name)
-                    logging.info("restart {} at {}".format(group_name, cur_now))
-                elif program_name:
-                    server.supervisor.stopProcess(program_name)
-                    server.supervisor.startProcess(program_name)
-                    logging.info("restart {} at {}".format(program_name, cur_now))
-                next_execute_time = time_iter.get_next(datetime)
-                logging.info("next restart time at {}".format(next_execute_time))
+        try:
+            headers, _ = listener.wait()
+            if "TICK" in headers["eventname"]:
+                if datetime.now() >= next_execute_time:
+                    if args.action in ['stop', 'restart']:
+                        logging.info(f'stopping {target}')
+                        do_stop()
+                    if args.action in ['start', 'restart']:
+                        logging.info(f'starting {target}')
+                        do_start()
+
+                    next_execute_time = time_iter.get_next(datetime)
+                    logging.info(f"next execution due at {next_execute_time}")
             listener.ok()
+        except Exception:
+            listener.fail()
+            raise
 
 
 if __name__ == "__main__":
